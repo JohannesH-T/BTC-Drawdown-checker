@@ -1,0 +1,99 @@
+# btc_unprecedented_loss.py
+import requests
+import pandas as pd
+import matplotlib.pyplot as plt
+import yfinance as yf
+
+WINDOWS = [7, 10, 15, 30]  # days
+
+def fetch_btc_daily_history():
+    url = "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart"
+    params = {"vs_currency": "usd", "days": "max", "interval": "daily"}
+    try:
+        r = requests.get(url, params=params, timeout=30)
+        r.raise_for_status()
+        data = r.json()["prices"]  # [[timestamp_ms, price], ...]
+        df = pd.DataFrame(data, columns=["ts", "price"])
+        df["date"] = pd.to_datetime(df["ts"], unit="ms").dt.date
+        df = df.drop(columns=["ts"]).drop_duplicates("date").sort_values("date")
+        df = df.set_index("date")
+        return df
+    except requests.HTTPError as exc:
+        if exc.response is None or exc.response.status_code != 401:
+            raise
+        # Fallback to Yahoo Finance if CoinGecko requires auth
+        hist = yf.Ticker("BTC-USD").history(period="max", interval="1d")
+        if hist.empty:
+            raise RuntimeError("Failed to fetch BTC history from Yahoo Finance")
+        hist = hist.reset_index()
+        hist["date"] = pd.to_datetime(hist["Date"]).dt.date
+        df = hist[["date", "Close"]].rename(columns={"Close": "price"})
+        df = df.dropna().drop_duplicates("date").sort_values("date")
+        df = df.set_index("date")
+        return df
+
+def analyze_unprecedented_losses(df):
+    results = []
+    for n in WINDOWS:
+        # n-day return: price_today / price_n_days_ago - 1
+        ret = df["price"].pct_change(n).dropna()
+        latest_date = ret.index[-1]
+        latest_ret = ret.iloc[-1]
+        min_ret = ret.min()
+        min_date = ret.idxmin()
+        is_unprecedented = latest_ret == min_ret
+        # rank: 1 = worst, higher = less severe
+        rank = (ret.rank(ascending=True).iloc[-1])
+        percentile_worse_or_equal = rank / len(ret)
+        results.append({
+            "window_days": n,
+            "latest_date": latest_date,
+            "latest_return": latest_ret,
+            "worst_return": min_ret,
+            "worst_date": min_date,
+            "is_unprecedented": bool(is_unprecedented),
+            "rank_worst_is_1": int(rank),
+            "percentile_worse_or_equal": float(percentile_worse_or_equal)
+        })
+    return results
+
+def plot_rankings(results):
+    chart_df = pd.DataFrame(results).sort_values("window_days")
+    chart_df["percentile_worse_or_equal"] = chart_df["percentile_worse_or_equal"] * 100
+    fig, ax = plt.subplots(figsize=(8, 4.5))
+    ax.bar(
+        chart_df["window_days"].astype(str) + "d",
+        chart_df["percentile_worse_or_equal"],
+        color="steelblue"
+    )
+    ax.set_title("Current n-day return percentile vs history (lower = worse)")
+    ax.set_xlabel("Window (days)")
+    ax.set_ylabel("Percentile (worse or equal)")
+    ax.set_ylim(0, 100)
+    for idx, row in chart_df.iterrows():
+        ax.text(
+            str(row["window_days"]) + "d",
+            row["percentile_worse_or_equal"] + 1,
+            f"{row['latest_return']:.1%}",
+            ha="center",
+            va="bottom",
+            fontsize=9
+        )
+    plt.tight_layout()
+    plt.show()
+
+def main():
+    df = fetch_btc_daily_history()
+    results = analyze_unprecedented_losses(df)
+    for r in results:
+        print(
+            f"{r['window_days']}d | latest={r['latest_return']:.2%} "
+            f"(as of {r['latest_date']}) | worst={r['worst_return']:.2%} "
+            f"(on {r['worst_date']}) | unprecedented={r['is_unprecedented']} "
+            f"| rank={r['rank_worst_is_1']} "
+            f"| percentile={r['percentile_worse_or_equal']:.2%}"
+        )
+    plot_rankings(results)
+
+if __name__ == "__main__":
+    main()
